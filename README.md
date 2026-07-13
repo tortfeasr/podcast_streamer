@@ -4,15 +4,27 @@ A dark-themed podcast app UI, built as a small late-night-radio inspired listeni
 
 ## Features
 
-- Home feed with a "Continue listening" hero and horizontal show shelves
-- Search by show, host, or genre
-- Library of followed shows (follow/unfollow from any show page)
+- Home feed with a "Continue listening" hero and horizontal show shelves (placeholder content)
+- Real podcast search via the iTunes Search API — find and open any actual podcast
+- Library of followed shows (follow/unfollow from any show page; placeholder shows only)
 - Show pages listing all episodes
 - Dedicated episode detail pages with full show notes, like button, and a live waveform progress view
 - Persistent bottom player bar with play/pause/skip, volume, like, and an "Up Next" queue drawer
 - Responsive down to mobile
 
-All show and episode content is original placeholder content — no real podcasts, hosts, or audio are used.
+The Home feed and Library are original placeholder content — no real podcasts there. The **Search** tab is real: it queries the iTunes Search API, and opening a result fetches that show's actual RSS feed and plays real episode audio.
+
+### About real episode playback
+
+Browsers block cross-origin fetches to RSS feeds that don't send CORS headers (most don't), so real playback depends on a CORS proxy. By default the app falls back through a few free public proxies, which are **not reliably available** — in testing they were frequently down, rate-limited, or capped below typical feed sizes, so episode loading will often show an error.
+
+For reliable playback, deploy your own proxy:
+
+1. Go to [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **Create** → paste in the contents of [`cloudflare-worker/rss-proxy.js`](cloudflare-worker/rss-proxy.js) → **Deploy** (free tier).
+2. Update `ALLOWED_ORIGINS` in that file to match where you host this app, then redeploy.
+3. Copy the resulting `*.workers.dev` URL into `OWN_CORS_PROXY` near the top of `src/App.jsx`.
+
+Once set, your own Worker is tried first, before the public fallbacks.
 
 ## Running locally
 

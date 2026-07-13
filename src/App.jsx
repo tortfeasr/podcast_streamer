@@ -149,6 +149,113 @@ function fmtTime(s) {
   return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
+function coverBackground(show) {
+  return show.artworkUrl
+    ? { backgroundImage: `url(${show.artworkUrl})`, backgroundSize: "cover", backgroundPosition: "center" }
+    : { background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})` };
+}
+
+function parseDurationToSeconds(raw) {
+  if (!raw) return 0;
+  const trimmed = raw.trim();
+  if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+  const parts = trimmed.split(":").map((p) => parseInt(p, 10));
+  if (parts.some((p) => Number.isNaN(p))) return 0;
+  return parts.reduceRight((acc, val, i, arr) => acc + val * Math.pow(60, arr.length - 1 - i), 0);
+}
+
+function formatPubDate(raw) {
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function stripHtml(html) {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return (div.textContent || "").trim();
+}
+
+// RSS feeds mostly don't send CORS headers, so feed fetches are routed through a proxy.
+// Deploy cloudflare-worker/rss-proxy.js (free tier) and paste its *.workers.dev URL here for
+// reliable fetching. Public proxies below are kept only as a best-effort fallback — in testing
+// they were frequently down, rate-limited, or capped well under typical feed sizes.
+const OWN_CORS_PROXY = ""; // e.g. "https://rss-proxy.your-subdomain.workers.dev"
+
+const CORS_PROXIES = [
+  ...(OWN_CORS_PROXY ? [(url) => `${OWN_CORS_PROXY}?url=${encodeURIComponent(url)}`] : []),
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+];
+
+async function fetchViaCorsProxy(url) {
+  let lastError = new Error("All CORS proxies failed");
+  for (const buildProxyUrl of CORS_PROXIES) {
+    try {
+      const res = await fetch(buildProxyUrl(url));
+      if (!res.ok) throw new Error(`Proxy responded ${res.status}`);
+      const text = await res.text();
+      if (!text || text.length < 20) throw new Error("Empty proxy response");
+      return text;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+
+async function searchPodcasts(term) {
+  const url = `https://itunes.apple.com/search?media=podcast&limit=24&term=${encodeURIComponent(term)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Podcast search failed");
+  const data = await res.json();
+  return (data.results || [])
+    .filter((r) => r.feedUrl)
+    .map((r) => ({
+      id: `itunes-${r.collectionId}`,
+      source: "itunes",
+      title: r.collectionName,
+      host: r.artistName,
+      genre: r.primaryGenreName || "Podcast",
+      artworkUrl: r.artworkUrl600 || r.artworkUrl100,
+      feedUrl: r.feedUrl,
+      description: "",
+      episodes: [],
+      feedStatus: "idle",
+    }));
+}
+
+async function fetchShowFeed(feedUrl, showId) {
+  const xmlText = await fetchViaCorsProxy(feedUrl);
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  if (doc.querySelector("parsererror")) throw new Error("Feed parse failed");
+  const channelDescription = doc.querySelector("channel > description")?.textContent || "";
+  const items = Array.from(doc.querySelectorAll("item")).slice(0, 20);
+  const episodes = items
+    .map((item, i) => {
+      const audioUrl = item.querySelector("enclosure")?.getAttribute("url") || "";
+      const durationRaw =
+        item.getElementsByTagName("itunes:duration")[0]?.textContent ||
+        item.querySelector("duration")?.textContent;
+      const descRaw =
+        item.getElementsByTagName("itunes:summary")[0]?.textContent ||
+        item.querySelector("description")?.textContent ||
+        "";
+      return {
+        id: item.querySelector("guid")?.textContent || `${showId}-${i}`,
+        title: item.querySelector("title")?.textContent?.trim() || `Episode ${i + 1}`,
+        publishedAt: formatPubDate(item.querySelector("pubDate")?.textContent),
+        duration: parseDurationToSeconds(durationRaw),
+        description: stripHtml(descRaw),
+        audioUrl,
+      };
+    })
+    .filter((ep) => ep.audioUrl);
+  return { description: stripHtml(channelDescription), episodes };
+}
+
 function WaveBars({ progress, playing, barCount = 48, activeColor = C.amber, idleColor = C.elevated2, height = 28 }) {
   const heights = useMemo(() => {
     return Array.from({ length: barCount }, (_, i) => {
@@ -186,6 +293,8 @@ function WaveBars({ progress, playing, barCount = 48, activeColor = C.amber, idl
 
 function ShowCard({ show, onOpen, onPlayToggle, isCurrentPlaying }) {
   const [hover, setHover] = useState(false);
+  const accent = show.palette ? show.palette[0] : C.amber;
+  const hasEpisodes = show.episodes && show.episodes.length > 0;
   return (
     <div
       className="flex-shrink-0 cursor-pointer select-none"
@@ -199,30 +308,39 @@ function ShowCard({ show, onOpen, onPlayToggle, isCurrentPlaying }) {
         style={{
           width: "100%",
           height: 168,
-          background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})`,
-          boxShadow: hover ? `0 14px 28px -10px ${show.palette[0]}77` : "0 4px 12px -6px rgba(0,0,0,0.5)",
+          ...coverBackground(show),
+          boxShadow: hover ? `0 14px 28px -10px ${accent}77` : "0 4px 12px -6px rgba(0,0,0,0.5)",
           transform: hover ? "translateY(-4px)" : "translateY(0)",
           transition: "all 0.25s ease",
         }}
       >
-        <div style={{ position: "absolute", top: -32, right: -32, width: 120, height: 120, borderRadius: "50%", border: "1px solid rgba(255,255,255,0.15)" }} />
-        <div style={{ position: "absolute", top: -10, right: -10, width: 78, height: 78, borderRadius: "50%", border: "1px solid rgba(255,255,255,0.22)" }} />
-        <span className="text-xs font-semibold uppercase tracking-wide" style={{ color: "rgba(0,0,0,0.62)" }}>
+        {!show.artworkUrl && (
+          <>
+            <div style={{ position: "absolute", top: -32, right: -32, width: 120, height: 120, borderRadius: "50%", border: "1px solid rgba(255,255,255,0.15)" }} />
+            <div style={{ position: "absolute", top: -10, right: -10, width: 78, height: 78, borderRadius: "50%", border: "1px solid rgba(255,255,255,0.22)" }} />
+          </>
+        )}
+        {show.artworkUrl && (
+          <div style={{ position: "absolute", inset: 0, background: "linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.6) 100%)" }} />
+        )}
+        <span className="relative text-xs font-semibold uppercase tracking-wide" style={{ color: show.artworkUrl ? C.cream : "rgba(0,0,0,0.62)" }}>
           {show.genre}
         </span>
         {hover && (
           <div
             className="absolute inset-0 flex items-center justify-center"
-            style={{ background: "rgba(21,17,28,0.45)" }}
-            onClick={(e) => { e.stopPropagation(); onPlayToggle(show, show.episodes[0]); }}
+            style={{ background: "rgba(21,17,28,0.45)", cursor: hasEpisodes ? "pointer" : "default" }}
+            onClick={(e) => { e.stopPropagation(); if (hasEpisodes) onPlayToggle(show, show.episodes[0]); }}
           >
-            <div className="rounded-full flex items-center justify-center" style={{ width: 52, height: 52, background: C.amber, boxShadow: "0 6px 18px rgba(0,0,0,0.4)" }}>
-              {isCurrentPlaying ? (
-                <Pause size={20} color={C.void} fill={C.void} />
-              ) : (
-                <Play size={22} color={C.void} fill={C.void} style={{ marginLeft: 2 }} />
-              )}
-            </div>
+            {hasEpisodes && (
+              <div className="rounded-full flex items-center justify-center" style={{ width: 52, height: 52, background: C.amber, boxShadow: "0 6px 18px rgba(0,0,0,0.4)" }}>
+                {isCurrentPlaying ? (
+                  <Pause size={20} color={C.void} fill={C.void} />
+                ) : (
+                  <Play size={22} color={C.void} fill={C.void} style={{ marginLeft: 2 }} />
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -250,7 +368,7 @@ function Shelf({ title, shows, onOpen, onPlayToggle, currentEpisodeId, isPlaying
             show={show}
             onOpen={onOpen}
             onPlayToggle={onPlayToggle}
-            isCurrentPlaying={isPlaying && show.episodes[0].id === currentEpisodeId}
+            isCurrentPlaying={isPlaying && show.episodes?.[0]?.id === currentEpisodeId}
           />
         ))}
       </div>
@@ -293,7 +411,7 @@ function Sidebar({ active, setActive, followed, onOpenShow }) {
       <div className="flex-1 overflow-y-auto no-scrollbar px-3 flex flex-col gap-1 pb-4">
         {followed.map((show) => (
           <button key={show.id} className="flex items-center gap-3 px-3 py-2 rounded-lg text-left hover:bg-white/5 transition-colors focus-visible:outline-none" onClick={() => onOpenShow(show)}>
-            <div style={{ width: 28, height: 28, borderRadius: 6, flexShrink: 0, background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})` }} />
+            <div style={{ width: 28, height: 28, borderRadius: 6, flexShrink: 0, ...coverBackground(show) }} />
             <span className="text-sm truncate" style={{ color: C.muted }}>{show.title}</span>
           </button>
         ))}
@@ -349,37 +467,52 @@ function EpisodeRow({ show, episode, isCurrent, isPlayingThis, onPlayToggle, onO
 
 function ShowPage({ show, following, onToggleFollow, onBack, onPlayToggle, onOpenEpisode, currentEpisodeId, isPlaying }) {
   const isFollowing = following.includes(show.id);
+  const isReal = show.source === "itunes";
+  const feedStatus = isReal ? show.feedStatus || "idle" : "loaded";
+  const hasEpisodes = show.episodes && show.episodes.length > 0;
   return (
     <div>
       <button onClick={onBack} className="flex items-center gap-1 text-sm mb-6 focus-visible:outline-none" style={{ color: C.muted }}>
         <ArrowLeft size={16} /> Back
       </button>
       <div className="flex flex-col sm:flex-row items-start sm:items-end gap-6 mb-8">
-        <div className="rounded-2xl flex-shrink-0" style={{ width: 176, height: 176, background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})` }} />
+        <div className="rounded-2xl flex-shrink-0" style={{ width: 176, height: 176, ...coverBackground(show) }} />
         <div>
           <p className="text-xs uppercase tracking-wider mb-2" style={{ color: C.amber, letterSpacing: "0.1em" }}>{show.genre}</p>
           <h1 className="text-3xl mb-2" style={{ fontFamily: "Fraunces, serif", color: C.cream, fontWeight: 600 }}>{show.title}</h1>
           <p className="text-sm mb-4" style={{ color: C.muted }}>Hosted by {show.host}</p>
-          <p className="text-sm max-w-xl leading-relaxed mb-5" style={{ color: C.muted }}>{show.description}</p>
+          <p className="text-sm max-w-xl leading-relaxed mb-5" style={{ color: C.muted }}>
+            {feedStatus === "loading" ? "Loading show details…" : show.description}
+          </p>
           <div className="flex items-center gap-3">
             <button
-              onClick={() => onPlayToggle(show, show.episodes[0])}
+              onClick={() => hasEpisodes && onPlayToggle(show, show.episodes[0])}
+              disabled={!hasEpisodes}
               className="flex items-center gap-2 rounded-full px-5 py-2.5 focus-visible:outline-none"
-              style={{ background: C.amber, color: C.void, fontWeight: 600, fontSize: 14 }}
+              style={{ background: C.amber, color: C.void, fontWeight: 600, fontSize: 14, opacity: hasEpisodes ? 1 : 0.5, cursor: hasEpisodes ? "pointer" : "default" }}
             >
-              <Play size={15} fill={C.void} /> Play latest
+              <Play size={15} fill={C.void} /> {feedStatus === "loading" ? "Loading…" : "Play latest"}
             </button>
-            <button
-              onClick={() => onToggleFollow(show.id)}
-              className="rounded-full px-5 py-2.5 text-sm font-medium focus-visible:outline-none"
-              style={{ border: `1px solid ${isFollowing ? C.amber : C.hairline}`, color: isFollowing ? C.amber : C.cream }}
-            >
-              {isFollowing ? "Following" : "Follow"}
-            </button>
+            {!isReal && (
+              <button
+                onClick={() => onToggleFollow(show.id)}
+                className="rounded-full px-5 py-2.5 text-sm font-medium focus-visible:outline-none"
+                style={{ border: `1px solid ${isFollowing ? C.amber : C.hairline}`, color: isFollowing ? C.amber : C.cream }}
+              >
+                {isFollowing ? "Following" : "Follow"}
+              </button>
+            )}
           </div>
         </div>
       </div>
       <p className="text-xs uppercase tracking-wider mb-2" style={{ color: C.faint, letterSpacing: "0.08em" }}>Episodes</p>
+      {feedStatus === "loading" && <p className="text-sm mb-4" style={{ color: C.faint }}>Loading episodes…</p>}
+      {feedStatus === "error" && (
+        <p className="text-sm mb-4" style={{ color: C.faint }}>
+          Couldn't load episodes for this show — its feed may not allow fetching from a browser.
+        </p>
+      )}
+      {feedStatus === "loaded" && !hasEpisodes && <p className="text-sm mb-4" style={{ color: C.faint }}>No episodes found.</p>}
       <div>
         {show.episodes.map((ep) => (
           <EpisodeRow
@@ -397,14 +530,14 @@ function ShowPage({ show, following, onToggleFollow, onBack, onPlayToggle, onOpe
   );
 }
 
-function EpisodePage({ show, episode, onBack, isPlaying, isCurrent, onPlayToggle, progress, currentTime, liked, onToggleLike, moreEpisodes, onOpenEpisode }) {
+function EpisodePage({ show, episode, onBack, isPlaying, isCurrent, onPlayToggle, progress, currentTime, liveDuration, liked, onToggleLike, moreEpisodes, onOpenEpisode }) {
   return (
     <div>
       <button onClick={onBack} className="flex items-center gap-1 text-sm mb-6 focus-visible:outline-none" style={{ color: C.muted }}>
         <ArrowLeft size={16} /> Back to {show.title}
       </button>
       <div className="flex flex-col md:flex-row gap-8 mb-10">
-        <div className="rounded-2xl flex-shrink-0" style={{ width: 200, height: 200, background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})` }} />
+        <div className="rounded-2xl flex-shrink-0" style={{ width: 200, height: 200, ...coverBackground(show) }} />
         <div className="flex-1 min-w-0">
           <p className="text-xs uppercase tracking-wider mb-2" style={{ color: C.amber, letterSpacing: "0.1em" }}>{show.title} · {episode.publishedAt}</p>
           <h1 className="text-2xl md:text-3xl mb-2" style={{ fontFamily: "Fraunces, serif", color: C.cream, fontWeight: 600 }}>{episode.title}</h1>
@@ -428,7 +561,7 @@ function EpisodePage({ show, episode, onBack, isPlaying, isCurrent, onPlayToggle
               <WaveBars progress={progress} playing={isPlaying} barCount={70} height={26} />
               <div className="flex justify-between mt-1">
                 <span className="text-xs" style={{ color: C.faint, fontFamily: "JetBrains Mono, monospace" }}>{fmtTime(currentTime)}</span>
-                <span className="text-xs" style={{ color: C.faint, fontFamily: "JetBrains Mono, monospace" }}>{fmtTime(episode.duration)}</span>
+                <span className="text-xs" style={{ color: C.faint, fontFamily: "JetBrains Mono, monospace" }}>{fmtTime(liveDuration || episode.duration)}</span>
               </div>
             </div>
           )}
@@ -444,7 +577,7 @@ function EpisodePage({ show, episode, onBack, isPlaying, isCurrent, onPlayToggle
   );
 }
 
-function PlayerBar({ episode, show, isPlaying, onToggle, progress, currentTime, liked, onToggleLike, onQueueToggle, volume, setVolume, onNext, onPrev }) {
+function PlayerBar({ episode, show, isPlaying, onToggle, progress, currentTime, duration, liked, onToggleLike, onQueueToggle, volume, setVolume, onNext, onPrev }) {
   if (!episode) {
     return (
       <div className="flex items-center justify-center px-6" style={{ height: 88, background: C.surface, borderTop: `1px solid ${C.hairline}` }}>
@@ -455,7 +588,7 @@ function PlayerBar({ episode, show, isPlaying, onToggle, progress, currentTime, 
   return (
     <div className="flex items-center px-4 md:px-6 gap-4 md:gap-6" style={{ height: 88, background: C.surface, borderTop: `1px solid ${C.hairline}` }}>
       <div className="flex items-center gap-3 min-w-0" style={{ width: 220 }}>
-        <div className="rounded-lg flex-shrink-0" style={{ width: 52, height: 52, background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})` }} />
+        <div className="rounded-lg flex-shrink-0" style={{ width: 52, height: 52, ...coverBackground(show) }} />
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             {isPlaying && <span className="rounded-full flex-shrink-0" style={{ width: 6, height: 6, background: C.amber, animation: "pulseDot 1.6s infinite" }} />}
@@ -481,7 +614,7 @@ function PlayerBar({ episode, show, isPlaying, onToggle, progress, currentTime, 
           <div className="flex-1">
             <WaveBars progress={progress} playing={isPlaying} barCount={60} height={24} />
           </div>
-          <span className="text-xs hidden sm:block" style={{ color: C.faint, fontFamily: "JetBrains Mono, monospace", width: 38 }}>{fmtTime(episode.duration)}</span>
+          <span className="text-xs hidden sm:block" style={{ color: C.faint, fontFamily: "JetBrains Mono, monospace", width: 38 }}>{fmtTime(duration || episode.duration)}</span>
         </div>
       </div>
 
@@ -509,7 +642,7 @@ function QueueDrawer({ open, onClose, queue, onPlay, currentId }) {
           const isCurrent = episode.id === currentId;
           return (
             <button key={episode.id} onClick={() => onPlay(show, episode)} className="flex items-center gap-3 px-2 py-2 rounded-lg text-left hover:bg-white/5 focus-visible:outline-none" style={{ background: isCurrent ? C.elevated : "transparent" }}>
-              <div style={{ width: 40, height: 40, borderRadius: 8, flexShrink: 0, background: `linear-gradient(145deg, ${show.palette[0]}, ${show.palette[1]})` }} />
+              <div style={{ width: 40, height: 40, borderRadius: 8, flexShrink: 0, ...coverBackground(show) }} />
               <div className="min-w-0">
                 <p className="text-xs font-medium truncate" style={{ color: isCurrent ? C.amber : C.cream }}>{episode.title}</p>
                 <p className="text-xs truncate" style={{ color: C.muted }}>{show.title} · {fmtTime(episode.duration)}</p>
@@ -537,6 +670,12 @@ export default function PodcastApp() {
   const [volume, setVolume] = useState(0.7);
   const [queueOpen, setQueueOpen] = useState(false);
   const intervalRef = useRef(null);
+  const audioRef = useRef(null);
+
+  const [realShows, setRealShows] = useState({}); // itunes-<id> -> show, accumulated across searches
+  const [searchResultIds, setSearchResultIds] = useState([]);
+  const [searchStatus, setSearchStatus] = useState("idle"); // idle | loading | error
+  const [audioDuration, setAudioDuration] = useState(0); // live duration of the real <audio> element
 
   const followed = SHOWS.filter((s) => followingIds.includes(s.id));
   const queue = useMemo(
@@ -545,6 +684,7 @@ export default function PodcastApp() {
   );
 
   useEffect(() => {
+    if (currentEpisode?.audioUrl) return; // real playback drives currentTime via <audio> events instead
     if (isPlaying) {
       intervalRef.current = setInterval(() => {
         setCurrentTime((t) => {
@@ -558,6 +698,55 @@ export default function PodcastApp() {
     }
     return () => clearInterval(intervalRef.current);
   }, [isPlaying, currentEpisode]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (!currentEpisode?.audioUrl) {
+      audio.pause();
+      audio.removeAttribute("src");
+      return;
+    }
+    if (audio.src !== currentEpisode.audioUrl) {
+      audio.src = currentEpisode.audioUrl;
+      setAudioDuration(0);
+    }
+    if (isPlaying) {
+      audio.play().catch(() => setIsPlaying(false));
+    } else {
+      audio.pause();
+    }
+  }, [currentEpisode, isPlaying]);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.volume = volume;
+  }, [volume]);
+
+  useEffect(() => {
+    if (active !== "search" || !query.trim()) {
+      setSearchResultIds([]);
+      setSearchStatus("idle");
+      return;
+    }
+    setSearchStatus("loading");
+    const handle = setTimeout(() => {
+      searchPodcasts(query.trim())
+        .then((results) => {
+          setRealShows((prev) => {
+            const next = { ...prev };
+            results.forEach((r) => {
+              // keep any already-fetched episodes/description/feedStatus for shows seen before
+              next[r.id] = prev[r.id] ? { ...r, ...prev[r.id] } : r;
+            });
+            return next;
+          });
+          setSearchResultIds(results.map((r) => r.id));
+          setSearchStatus("idle");
+        })
+        .catch(() => setSearchStatus("error"));
+    }, 400);
+    return () => clearTimeout(handle);
+  }, [query, active]);
 
   function playEpisode(show, episode) {
     setCurrentShow(show);
@@ -574,9 +763,26 @@ export default function PodcastApp() {
     }
   }
 
+  function loadFeed(show) {
+    setRealShows((prev) => ({ ...prev, [show.id]: { ...prev[show.id], feedStatus: "loading" } }));
+    fetchShowFeed(show.feedUrl, show.id)
+      .then(({ description, episodes }) => {
+        setRealShows((prev) => ({
+          ...prev,
+          [show.id]: { ...prev[show.id], description, episodes, feedStatus: "loaded" },
+        }));
+      })
+      .catch(() => {
+        setRealShows((prev) => ({ ...prev, [show.id]: { ...prev[show.id], feedStatus: "error" } }));
+      });
+  }
+
   function openShow(show) {
     setViewingShowId(show.id);
     setPage("show");
+    if (show.source === "itunes" && (!show.feedStatus || show.feedStatus === "idle")) {
+      loadFeed(show);
+    }
   }
 
   function openEpisode(show, episode) {
@@ -608,22 +814,25 @@ export default function PodcastApp() {
   }
 
   function handlePrev() {
-    setCurrentTime(0);
+    if (currentEpisode?.audioUrl && audioRef.current) {
+      audioRef.current.currentTime = 0;
+    } else {
+      setCurrentTime(0);
+    }
   }
 
-  const progress = currentEpisode ? Math.min(currentTime / currentEpisode.duration, 1) : 0;
-
-  const searchResults = useMemo(() => {
-    if (!query.trim()) return [];
-    const q = query.toLowerCase();
-    return SHOWS.filter((s) => s.title.toLowerCase().includes(q) || s.host.toLowerCase().includes(q) || s.genre.toLowerCase().includes(q));
-  }, [query]);
+  const effectiveDuration = currentEpisode?.audioUrl ? audioDuration || currentEpisode.duration || 0 : currentEpisode?.duration || 0;
+  const progress = currentEpisode && effectiveDuration ? Math.min(currentTime / effectiveDuration, 1) : 0;
 
   const shelvesA = SHOWS.slice(0, 5);
   const shelvesB = [...SHOWS].reverse().slice(0, 5);
   const lateNight = SHOWS.filter((s) => ["Mystery", "Sleep & Calm", "Urban Legends"].includes(s.genre));
 
-  const viewingShow = viewingShowId ? SHOWS.find((s) => s.id === viewingShowId) : null;
+  const viewingShow = viewingShowId
+    ? viewingShowId.startsWith("itunes-")
+      ? realShows[viewingShowId]
+      : SHOWS.find((s) => s.id === viewingShowId)
+    : null;
   const viewingEpisode = viewingShow && viewingEpisodeId ? viewingShow.episodes.find((e) => e.id === viewingEpisodeId) : null;
 
   return (
@@ -637,6 +846,19 @@ export default function PodcastApp() {
         input[type="range"] { -webkit-appearance: none; height: 3px; background: ${C.elevated2}; border-radius: 999px; }
         input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px; height: 11px; border-radius: 50%; background: ${C.amber}; cursor: pointer; }
       `}</style>
+
+      <audio
+        ref={audioRef}
+        onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
+        onLoadedMetadata={(e) => {
+          if (Number.isFinite(e.target.duration)) setAudioDuration(e.target.duration);
+        }}
+        onEnded={() => {
+          setIsPlaying(false);
+          setCurrentTime(currentEpisode?.duration || 0);
+        }}
+        style={{ display: "none" }}
+      />
 
       <div className="flex flex-1 min-h-0">
         <Sidebar active={active} setActive={(id) => { setActive(id); setPage("list"); }} followed={followed} onOpenShow={openShow} />
@@ -652,7 +874,7 @@ export default function PodcastApp() {
                       autoFocus
                       value={query}
                       onChange={(e) => setQuery(e.target.value)}
-                      placeholder="Search shows, hosts, genres"
+                      placeholder="Search real podcasts…"
                       className="bg-transparent outline-none text-sm flex-1"
                       style={{ color: C.cream }}
                     />
@@ -709,14 +931,28 @@ export default function PodcastApp() {
             {page === "list" && active === "search" && (
               <div>
                 {query.trim() === "" ? (
-                  <p className="text-sm" style={{ color: C.faint }}>Search for a show, host, or genre.</p>
-                ) : searchResults.length === 0 ? (
+                  <p className="text-sm" style={{ color: C.faint }}>Search for a real podcast by show name, host, or topic.</p>
+                ) : searchStatus === "loading" ? (
+                  <p className="text-sm" style={{ color: C.faint }}>Searching…</p>
+                ) : searchStatus === "error" ? (
+                  <p className="text-sm" style={{ color: C.faint }}>Search failed. Try again in a moment.</p>
+                ) : searchResultIds.length === 0 ? (
                   <p className="text-sm" style={{ color: C.faint }}>No shows found for "{query}".</p>
                 ) : (
                   <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(168px, 1fr))" }}>
-                    {searchResults.map((show) => (
-                      <ShowCard key={show.id} show={show} onOpen={openShow} onPlayToggle={handlePlayToggle} isCurrentPlaying={isPlaying && show.episodes[0].id === currentEpisode?.id} />
-                    ))}
+                    {searchResultIds.map((id) => {
+                      const show = realShows[id];
+                      if (!show) return null;
+                      return (
+                        <ShowCard
+                          key={show.id}
+                          show={show}
+                          onOpen={openShow}
+                          onPlayToggle={handlePlayToggle}
+                          isCurrentPlaying={isPlaying && show.episodes?.[0]?.id === currentEpisode?.id}
+                        />
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -745,6 +981,7 @@ export default function PodcastApp() {
                 onPlayToggle={handlePlayToggle}
                 progress={progress}
                 currentTime={currentTime}
+                liveDuration={effectiveDuration}
                 liked={!!liked[viewingEpisode.id]}
                 onToggleLike={toggleLike}
                 moreEpisodes={viewingShow.episodes.filter((e) => e.id !== viewingEpisode.id)}
@@ -764,6 +1001,7 @@ export default function PodcastApp() {
         onToggle={() => setIsPlaying((p) => !p)}
         progress={progress}
         currentTime={currentTime}
+        duration={effectiveDuration}
         liked={!!liked[currentEpisode?.id]}
         onToggleLike={() => toggleLike(currentEpisode.id)}
         onQueueToggle={() => setQueueOpen((o) => !o)}
