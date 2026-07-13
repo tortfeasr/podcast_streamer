@@ -181,7 +181,7 @@ function stripHtml(html) {
 // Deploy cloudflare-worker/rss-proxy.js (free tier) and paste its *.workers.dev URL here for
 // reliable fetching. Public proxies below are kept only as a best-effort fallback — in testing
 // they were frequently down, rate-limited, or capped well under typical feed sizes.
-const OWN_CORS_PROXY = ""; // e.g. "https://rss-proxy.your-subdomain.workers.dev"
+const OWN_CORS_PROXY = "https://black-meadow-203e.ndeganhart.workers.dev";
 
 const CORS_PROXIES = [
   ...(OWN_CORS_PROXY ? [(url) => `${OWN_CORS_PROXY}?url=${encodeURIComponent(url)}`] : []),
